@@ -34,6 +34,14 @@
 #include <sys/sysctl.h>
 #endif
 
+#ifdef __FreeBSD__
+#include <pthread_np.h>
+#endif
+
+#ifdef __NetBSD__
+#include <lwp.h>
+#endif
+
 #if defined(__myriad2__)
 #include <rtems.h>
 #endif
@@ -190,7 +198,13 @@ static double GetNominalCPUFrequency() {
 // and the memory location pointed to by value is set to the value read.
 static bool ReadLongFromFile(const char *file, long *value) {
   bool ret = false;
-  int fd = open(file, O_RDONLY | O_CLOEXEC);
+#if defined(_POSIX_C_SOURCE)
+  const int file_mode = (O_RDONLY | O_CLOEXEC);
+#else
+  const int file_mode = O_RDONLY;
+#endif
+
+  int fd = open(file, file_mode);
   if (fd != -1) {
     char line[1024];
     char *err;
@@ -424,6 +438,27 @@ pid_t GetTID() {
   // it.
   pthread_threadid_np(nullptr, &tid);
   return static_cast<pid_t>(tid);
+}
+
+#elif defined(__FreeBSD__)
+
+pid_t GetTID() { return static_cast<pid_t>(pthread_getthreadid_np()); }
+
+#elif defined(__OpenBSD__)
+
+pid_t GetTID() { return getthrid(); }
+
+#elif defined(__NetBSD__)
+
+pid_t GetTID() { return static_cast<pid_t>(_lwp_self()); }
+
+#elif defined(__native_client__)
+
+pid_t GetTID() {
+  auto* thread = pthread_self();
+  static_assert(sizeof(pid_t) == sizeof(thread),
+                "In NaCL int expected to be the same size as a pointer");
+  return reinterpret_cast<pid_t>(thread);
 }
 
 #else

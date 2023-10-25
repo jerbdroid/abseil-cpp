@@ -36,9 +36,15 @@
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/memory/memory.h"
+#include "absl/synchronization/internal/create_thread_identity.h"
 #include "absl/synchronization/internal/thread_pool.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+
+#ifdef ABSL_HAVE_PTHREAD_GETSCHEDPARAM
+#include <pthread.h>
+#include <string.h>
+#endif
 
 namespace {
 
@@ -1019,6 +1025,19 @@ TEST(Mutex, FunctorCondition) {
   }
 }
 
+TEST(Mutex, ConditionSwap) {
+  // Ensure that Conditions can be swap'ed.
+  bool b1 = true;
+  absl::Condition c1(&b1);
+  bool b2 = false;
+  absl::Condition c2(&b2);
+  EXPECT_TRUE(c1.Eval());
+  EXPECT_FALSE(c2.Eval());
+  std::swap(c1, c2);
+  EXPECT_FALSE(c1.Eval());
+  EXPECT_TRUE(c2.Eval());
+}
+
 // --------------------------------------------------------
 // Test for bug with pattern of readers using a condvar.  The bug was that if a
 // reader went to sleep on a condition variable while one or more other readers
@@ -1836,6 +1855,115 @@ TEST(Mutex, SignalExitedThread) {
     });
   }
   for (auto &th : top) th.join();
+}
+
+TEST(Mutex, WriterPriority) {
+  absl::Mutex mu;
+  bool wrote = false;
+  std::atomic<bool> saw_wrote{false};
+  auto readfunc = [&]() {
+    for (size_t i = 0; i < 10; ++i) {
+      absl::ReaderMutexLock lock(&mu);
+      if (wrote) {
+        saw_wrote = true;
+        break;
+      }
+      absl::SleepFor(absl::Seconds(1));
+    }
+  };
+  std::thread t1(readfunc);
+  absl::SleepFor(absl::Milliseconds(500));
+  std::thread t2(readfunc);
+  // Note: this test guards against a bug that was related to an uninit
+  // PerThreadSynch::priority, so the writer intentionally runs on a new thread.
+  std::thread t3([&]() {
+    // The writer should be able squeeze between the two alternating readers.
+    absl::MutexLock lock(&mu);
+    wrote = true;
+  });
+  t1.join();
+  t2.join();
+  t3.join();
+  EXPECT_TRUE(saw_wrote.load());
+}
+
+#ifdef ABSL_HAVE_PTHREAD_GETSCHEDPARAM
+TEST(Mutex, CondVarPriority) {
+  // A regression test for a bug in condition variable wait morphing,
+  // which resulted in the waiting thread getting priority of the waking thread.
+  int err = 0;
+  sched_param param;
+  param.sched_priority = 7;
+  std::thread test([&]() {
+    err = pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+  });
+  test.join();
+  if (err) {
+    // Setting priority usually requires special privileges.
+    GTEST_SKIP() << "failed to set priority: " << strerror(err);
+  }
+  absl::Mutex mu;
+  absl::CondVar cv;
+  bool locked = false;
+  bool notified = false;
+  bool waiting = false;
+  bool morph = false;
+  std::thread th([&]() {
+    EXPECT_EQ(0, pthread_setschedparam(pthread_self(), SCHED_FIFO, &param));
+    mu.Lock();
+    locked = true;
+    mu.Await(absl::Condition(&notified));
+    mu.Unlock();
+    EXPECT_EQ(absl::synchronization_internal::GetOrCreateCurrentThreadIdentity()
+                  ->per_thread_synch.priority,
+              param.sched_priority);
+    mu.Lock();
+    mu.Await(absl::Condition(&waiting));
+    morph = true;
+    absl::SleepFor(absl::Seconds(1));
+    cv.Signal();
+    mu.Unlock();
+  });
+  mu.Lock();
+  mu.Await(absl::Condition(&locked));
+  notified = true;
+  mu.Unlock();
+  mu.Lock();
+  waiting = true;
+  while (!morph) {
+    cv.Wait(&mu);
+  }
+  mu.Unlock();
+  th.join();
+  EXPECT_NE(absl::synchronization_internal::GetOrCreateCurrentThreadIdentity()
+                ->per_thread_synch.priority,
+            param.sched_priority);
+}
+#endif
+
+TEST(Mutex, LockWhenWithTimeoutResult) {
+  // Check various corner cases for Await/LockWhen return value
+  // with always true/always false conditions.
+  absl::Mutex mu;
+  const bool kAlwaysTrue = true, kAlwaysFalse = false;
+  const absl::Condition kTrueCond(&kAlwaysTrue), kFalseCond(&kAlwaysFalse);
+  EXPECT_TRUE(mu.LockWhenWithTimeout(kTrueCond, absl::Milliseconds(1)));
+  mu.Unlock();
+  EXPECT_FALSE(mu.LockWhenWithTimeout(kFalseCond, absl::Milliseconds(1)));
+  EXPECT_TRUE(mu.AwaitWithTimeout(kTrueCond, absl::Milliseconds(1)));
+  EXPECT_FALSE(mu.AwaitWithTimeout(kFalseCond, absl::Milliseconds(1)));
+  std::thread th1([&]() {
+    EXPECT_TRUE(mu.LockWhenWithTimeout(kTrueCond, absl::Milliseconds(1)));
+    mu.Unlock();
+  });
+  std::thread th2([&]() {
+    EXPECT_FALSE(mu.LockWhenWithTimeout(kFalseCond, absl::Milliseconds(1)));
+    mu.Unlock();
+  });
+  absl::SleepFor(absl::Milliseconds(100));
+  mu.Unlock();
+  th1.join();
+  th2.join();
 }
 
 }  // namespace
