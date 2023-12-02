@@ -18,3 +18,6 @@ copts/__pycache__/
 
 bin/
 bin-int/
+
+# Generated makefiles
+Makefile 
