@@ -85,7 +85,7 @@ enum Constants {
 };
 
 // Emits a fatal error "Unexpected node type: xyz" and aborts the program.
-ABSL_ATTRIBUTE_NORETURN void LogFatalNodeType(CordRep* rep);
+[[noreturn]] void LogFatalNodeType(CordRep* rep);
 
 // Fast implementation of memmove for up to 15 bytes. This implementation is
 // safe for overlapping regions. If nullify_tail is true, the destination is
@@ -259,7 +259,7 @@ struct CordRep {
   // on the specific layout of these fields. Notably: the non-trivial field
   // `refcount` being preceded by `length`, and being tailed by POD data
   // members only.
-  // # LINT.IfChange
+  // LINT.IfChange
   size_t length;
   RefcountAndFlags refcount;
   // If tag < FLAT, it represents CordRepKind and indicates the type of node.
@@ -275,7 +275,7 @@ struct CordRep {
   // allocate room for these in the derived class, as not all compilers reuse
   // padding space from the base class (clang and gcc do, MSVC does not, etc)
   uint8_t storage[3];
-  // # LINT.ThenChange(cord_rep_btree.h:copy_raw)
+  // LINT.ThenChange(cord_rep_btree.h:copy_raw)
 
   // Returns true if this instance's tag matches the requested type.
   constexpr bool IsSubstring() const { return tag == SUBSTRING; }
@@ -352,18 +352,19 @@ struct CordRepExternal : public CordRep {
   static void Delete(CordRep* rep);
 };
 
-struct Rank1 {};
-struct Rank0 : Rank1 {};
+// Use go/ranked-overloads for dispatching.
+struct Rank0 {};
+struct Rank1 : Rank0 {};
 
 template <typename Releaser, typename = ::absl::base_internal::invoke_result_t<
                                  Releaser, absl::string_view>>
-void InvokeReleaser(Rank0, Releaser&& releaser, absl::string_view data) {
+void InvokeReleaser(Rank1, Releaser&& releaser, absl::string_view data) {
   ::absl::base_internal::invoke(std::forward<Releaser>(releaser), data);
 }
 
 template <typename Releaser,
           typename = ::absl::base_internal::invoke_result_t<Releaser>>
-void InvokeReleaser(Rank1, Releaser&& releaser, absl::string_view) {
+void InvokeReleaser(Rank0, Releaser&& releaser, absl::string_view) {
   ::absl::base_internal::invoke(std::forward<Releaser>(releaser));
 }
 
@@ -381,7 +382,7 @@ struct CordRepExternalImpl
   }
 
   ~CordRepExternalImpl() {
-    InvokeReleaser(Rank0{}, std::move(this->template get<0>()),
+    InvokeReleaser(Rank1{}, std::move(this->template get<0>()),
                    absl::string_view(base, length));
   }
 
@@ -398,7 +399,6 @@ inline CordRepSubstring* CordRepSubstring::Create(CordRep* child, size_t pos,
   assert(pos < child->length);
   assert(n <= child->length - pos);
 
-  // TODO(b/217376272): Harden internal logic.
   // Move to strategical places inside the Cord logic and make this an assert.
   if (ABSL_PREDICT_FALSE(!(child->IsExternal() || child->IsFlat()))) {
     LogFatalNodeType(child);
